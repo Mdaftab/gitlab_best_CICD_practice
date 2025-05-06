@@ -1,0 +1,154 @@
+# Example GitLab CI configuration for optimized Docker builds
+# This example demonstrates efficient Docker build configuration with caching and optimization
+
+stages:
+  - build
+  - scan
+  - publish
+
+variables:
+  # Docker and Container Registry configuration
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_TLS_VERIFY: 1
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  
+  # Image information
+  IMAGE_NAME: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+  LATEST_IMAGE: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:latest
+
+  # BuildKit configuration
+  DOCKER_BUILDKIT: 1
+  BUILDKIT_PROGRESS: plain
+
+# Template for Docker operations
+.docker_template:
+  image: docker:23.0.1
+  services:
+    - docker:23.0.1-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
+# Basic Docker build with layer caching
+docker_build:
+  extends: .docker_template
+  stage: build
+  script:
+    # Pull cache layers
+    - docker pull $LATEST_IMAGE || true
+    
+    # Build with cache
+    - >
+      docker build
+      --cache-from $LATEST_IMAGE
+      --build-arg BUILDKIT_INLINE_CACHE=1
+      --tag $IMAGE_NAME:$IMAGE_TAG
+      --tag $LATEST_IMAGE
+      .
+    
+    # Push the images
+    - docker push $IMAGE_NAME:$IMAGE_TAG
+    - docker push $LATEST_IMAGE
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Multi-stage optimized Docker build with BuildKit
+docker_build_advanced:
+  extends: .docker_template
+  stage: build
+  script:
+    # Create BuildKit cache volumes
+    - docker volume create buildkit-cache || true
+    
+    # Pull existing images for cache
+    - docker pull $LATEST_IMAGE || true
+    
+    # Build with BuildKit cache
+    - >
+      docker build
+      --pull
+      --cache-from $LATEST_IMAGE
+      --build-arg BUILDKIT_INLINE_CACHE=1
+      --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+      --build-arg VCS_REF=$CI_COMMIT_SHORT_SHA
+      --build-arg VERSION=$CI_COMMIT_REF_NAME
+      --tag $IMAGE_NAME:$IMAGE_TAG
+      --tag $LATEST_IMAGE
+      .
+    
+    # Push the images
+    - docker push $IMAGE_NAME:$IMAGE_TAG
+    - docker push $LATEST_IMAGE
+  artifacts:
+    paths:
+      - container_scanning_report.json
+    reports:
+      container_scanning: container_scanning_report.json
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $USE_ADVANCED_BUILD == "true"
+
+# Multi-architecture Docker build
+docker_build_multiarch:
+  extends: .docker_template
+  stage: build
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker buildx create --use
+  script:
+    # Build for multiple architectures
+    - >
+      docker buildx build
+      --platform linux/amd64,linux/arm64
+      --cache-from $LATEST_IMAGE
+      --build-arg BUILDKIT_INLINE_CACHE=1
+      --tag $IMAGE_NAME:$IMAGE_TAG
+      --tag $LATEST_IMAGE
+      --push
+      .
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $BUILD_MULTIARCH == "true"
+
+# Container scanning for security vulnerabilities
+container_scan:
+  stage: scan
+  image: 
+    name: registry.gitlab.com/gitlab-org/security-products/container-scanning:5
+    entrypoint: [""]
+  variables:
+    CS_IMAGE: $IMAGE_NAME:$IMAGE_TAG
+  allows_failure: true
+  dependencies:
+    - docker_build
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Publish to Container Registry
+publish_image:
+  extends: .docker_template
+  stage: publish
+  variables:
+    # Tag with semantic version if available
+    VERSION_TAG: ${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+  script:
+    # Pull the build image
+    - docker pull $IMAGE_NAME:$IMAGE_TAG
+    
+    # Tag with version and push
+    - docker tag $IMAGE_NAME:$IMAGE_TAG $CI_REGISTRY_IMAGE:$VERSION_TAG
+    - docker push $CI_REGISTRY_IMAGE:$VERSION_TAG
+    
+    # Tag as latest if on default branch
+    - |
+      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
+        docker tag $IMAGE_NAME:$IMAGE_TAG $CI_REGISTRY_IMAGE:latest
+        docker push $CI_REGISTRY_IMAGE:latest
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG

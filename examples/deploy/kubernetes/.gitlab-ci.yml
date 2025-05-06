@@ -1,0 +1,256 @@
+# Example GitLab CI configuration for Kubernetes deployments
+# This example demonstrates different deployment strategies and Kubernetes management approaches
+
+stages:
+  - build
+  - validate
+  - deploy
+  - verify
+
+variables:
+  # Kubernetes configuration
+  KUBE_NAMESPACE: ${CI_PROJECT_NAME}-${CI_ENVIRONMENT_SLUG}
+  APP_NAME: ${CI_PROJECT_NAME}
+  
+  # Container Registry
+  CONTAINER_IMAGE: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}
+  
+  # Helm configuration
+  HELM_RELEASE_NAME: ${CI_PROJECT_NAME}-${CI_ENVIRONMENT_SLUG}
+
+# Build the application container image
+build_image:
+  stage: build
+  image: docker:23.0.1
+  services:
+    - docker:23.0.1-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CONTAINER_IMAGE .
+    - docker push $CONTAINER_IMAGE
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Validate Kubernetes manifests
+validate_manifests:
+  stage: validate
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  script:
+    - kubectl --dry-run=client -f kubernetes/manifests/ validate
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Validate Helm charts
+validate_helm:
+  stage: validate
+  image:
+    name: alpine/helm:latest
+    entrypoint: [""]
+  script:
+    - helm lint kubernetes/charts/
+    - helm template kubernetes/charts/ --validate
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $USE_HELM == "true"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $USE_HELM == "true"
+
+# Deploy to development environment using raw manifests
+deploy_dev:
+  stage: deploy
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  environment:
+    name: development
+    on_stop: stop_dev
+  script:
+    # Create namespace if it doesn't exist
+    - kubectl create namespace $KUBE_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Update image tag in deployment
+    - sed -i "s|__CI_REGISTRY_IMAGE__|${CONTAINER_IMAGE}|g" kubernetes/manifests/deployment.yaml
+    
+    # Apply Kubernetes manifests
+    - kubectl apply -f kubernetes/manifests/ -n $KUBE_NAMESPACE
+    
+    # Wait for deployment to complete
+    - kubectl rollout status deployment/$APP_NAME -n $KUBE_NAMESPACE --timeout=180s
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $USE_HELM != "true"
+
+# Stop development environment
+stop_dev:
+  stage: deploy
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  environment:
+    name: development
+    action: stop
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - kubectl delete namespace $KUBE_NAMESPACE
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $USE_HELM != "true"
+  when: manual
+
+# Deploy to staging using Helm
+deploy_staging_helm:
+  stage: deploy
+  image:
+    name: alpine/helm:latest
+    entrypoint: [""]
+  environment:
+    name: staging
+    on_stop: stop_staging_helm
+  script:
+    # Update values file with the correct image
+    - sed -i "s|__CI_REGISTRY_IMAGE__|${CONTAINER_IMAGE}|g" kubernetes/charts/values.yaml
+    
+    # Add Kubernetes config
+    - mkdir -p ~/.kube
+    - echo -n $KUBE_CONFIG | base64 -d > ~/.kube/config
+    
+    # Deploy with Helm
+    - >
+      helm upgrade --install $HELM_RELEASE_NAME kubernetes/charts/
+      --namespace $KUBE_NAMESPACE
+      --create-namespace
+      --atomic
+      --timeout 5m
+      --values kubernetes/charts/values.yaml
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $USE_HELM == "true"
+
+# Stop staging environment
+stop_staging_helm:
+  stage: deploy
+  image:
+    name: alpine/helm:latest
+    entrypoint: [""]
+  environment:
+    name: staging
+    action: stop
+  variables:
+    GIT_STRATEGY: none
+  script:
+    # Add Kubernetes config
+    - mkdir -p ~/.kube
+    - echo -n $KUBE_CONFIG | base64 -d > ~/.kube/config
+    
+    # Uninstall the Helm release
+    - helm uninstall $HELM_RELEASE_NAME --namespace $KUBE_NAMESPACE
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $USE_HELM == "true"
+  when: manual
+
+# Deploy to production using GitLab Agent for Kubernetes
+deploy_production:
+  stage: deploy
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  environment:
+    name: production
+  script:
+    # Update image tag in deployment
+    - sed -i "s|__CI_REGISTRY_IMAGE__|${CONTAINER_IMAGE}|g" kubernetes/manifests/deployment.yaml
+    
+    # Apply Kubernetes manifests using GitLab Agent
+    - |
+      cat <<EOF > kubeconfig.yaml
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - name: gitlab-agent
+        cluster:
+          server: https://kas.gitlab.com/k8s-proxy/
+      users:
+      - name: gitlab-agent
+        user:
+          token: $GITLAB_AGENT_TOKEN
+      contexts:
+      - name: gitlab-agent
+        context:
+          cluster: gitlab-agent
+          user: gitlab-agent
+      current-context: gitlab-agent
+      EOF
+    
+    # Apply using GitLab Agent
+    - kubectl --kubeconfig=kubeconfig.yaml apply -f kubernetes/manifests/ -n production
+    - kubectl --kubeconfig=kubeconfig.yaml rollout status deployment/$APP_NAME -n production --timeout=300s
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DEPLOY_TO_PRODUCTION == "true"
+  when: manual
+
+# Perform canary deployment for production
+deploy_canary:
+  stage: deploy
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  environment:
+    name: production
+  script:
+    # Create canary deployment with small replica count
+    - sed -i "s|__CI_REGISTRY_IMAGE__|${CONTAINER_IMAGE}|g" kubernetes/manifests/canary-deployment.yaml
+    - kubectl apply -f kubernetes/manifests/canary-deployment.yaml -n production
+    - kubectl rollout status deployment/${APP_NAME}-canary -n production --timeout=180s
+    
+    # Wait for 10 minutes to collect metrics
+    - echo "Canary deployment is live. Collecting metrics for 10 minutes..."
+    - sleep 600
+    
+    # If needed, promote canary to full deployment
+    - |
+      if [[ "$PROMOTE_CANARY" == "true" ]]; then
+        echo "Promoting canary to full deployment"
+        sed -i "s|__CI_REGISTRY_IMAGE__|${CONTAINER_IMAGE}|g" kubernetes/manifests/deployment.yaml
+        kubectl apply -f kubernetes/manifests/deployment.yaml -n production
+        kubectl rollout status deployment/$APP_NAME -n production --timeout=300s
+        
+        # Remove canary deployment
+        kubectl delete -f kubernetes/manifests/canary-deployment.yaml -n production
+      else
+        echo "Canary deployment not promoted. Rollback."
+        kubectl delete -f kubernetes/manifests/canary-deployment.yaml -n production
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $USE_CANARY_DEPLOYMENT == "true"
+  when: manual
+
+# Verify deployment health
+verify_deployment:
+  stage: verify
+  image: curlimages/curl:latest
+  script:
+    - |
+      for i in {1..30}; do
+        HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://${CI_ENVIRONMENT_SLUG}.${APP_DOMAIN}/health)
+        if [ "$HEALTH_STATUS" == "200" ]; then
+          echo "Application is healthy!"
+          exit 0
+        fi
+        echo "Waiting for application to become healthy... (attempt $i/30)"
+        sleep 10
+      done
+      echo "Application failed to become healthy within timeout."
+      exit 1
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  needs:
+    - job: deploy_dev
+      optional: true
+    - job: deploy_staging_helm
+      optional: true
+    - job: deploy_production
+      optional: true
+    - job: deploy_canary
+      optional: true

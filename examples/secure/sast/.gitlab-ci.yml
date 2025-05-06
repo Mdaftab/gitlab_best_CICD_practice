@@ -1,0 +1,186 @@
+# Example GitLab CI configuration for Static Application Security Testing (SAST)
+# This example demonstrates comprehensive SAST configuration with customizations
+
+include:
+  # Include GitLab SAST template - automatically selects language-specific analyzers
+  - template: Security/SAST.gitlab-ci.yml
+
+stages:
+  - test
+  - build
+  - sast
+  - deploy
+
+variables:
+  # SAST configuration
+  SAST_EXCLUDED_PATHS: "spec, test, tests, tmp"
+  SAST_EXCLUDED_ANALYZERS: "spotbugs, pmd"
+  SEARCH_MAX_DEPTH: 20
+  SECURE_LOG_LEVEL: "info"
+  
+  # Configure findings threshold
+  SAST_VULNERABILITY_THRESHOLD: "Medium"
+  
+  # Custom analyzer configuration
+  SEMGREP_RULES: "p/owasp-top-ten,p/cwe-top-25"
+  KUBESEC_ARGS: "--threshold critical"
+
+# Custom SAST job for JavaScript/TypeScript using ESLint
+eslint-sast:
+  stage: sast
+  image: node:16-alpine
+  script:
+    - npm ci
+    - npm install -g eslint @typescript-eslint/parser @typescript-eslint/eslint-plugin eslint-plugin-security
+    - |
+      eslint \
+        --no-eslintrc \
+        --plugin security \
+        --parser @typescript-eslint/parser \
+        --parser-options "{\"project\": \"./tsconfig.json\"}" \
+        --ext .js,.jsx,.ts,.tsx \
+        --rule "security/detect-object-injection: error" \
+        --rule "security/detect-non-literal-fs-filename: error" \
+        --rule "security/detect-eval-with-expression: error" \
+        --rule "security/detect-non-literal-regexp: error" \
+        --rule "security/detect-unsafe-regex: error" \
+        --rule "security/detect-buffer-noassert: error" \
+        --format json > eslint-report.json || true
+    - |
+      jq -r '.[] | select(.severity == 2) | "- **Error** in \(.filePath) at line \(.line): \(.message)"' eslint-report.json > eslint-sast-report.md
+  artifacts:
+    paths:
+      - eslint-report.json
+      - eslint-sast-report.md
+    reports:
+      sast: gl-sast-report.json
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Custom SAST job for container images
+container-sast:
+  stage: sast
+  image: 
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  script:
+    - trivy image --format json --output trivy-report.json $IMAGE_NAME
+    - |
+      cat trivy-report.json | jq -r '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | select(.Severity == "CRITICAL" or .Severity == "HIGH") | "- **\(.Severity)** \(.VulnerabilityID): \(.Title)"' > trivy-sast-report.md
+  artifacts:
+    paths:
+      - trivy-report.json
+      - trivy-sast-report.md
+    reports:
+      sast: gl-container-scanning-report.json
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $SCAN_CONTAINERS == "true"
+  needs:
+    - job: build_image
+      optional: true
+
+# Custom SAST for infrastructure as code
+iac-security-scan:
+  stage: sast
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint: [""]
+  script:
+    - checkov -d . --framework terraform,kubernetes,cloudformation,dockerfile --output json > checkov-report.json || true
+    - |
+      cat checkov-report.json | jq -r '.results.failed_checks[] | "- **\(.check_name)** in \(.file_path) at line \(.file_line_range[0]): \(.check_id)"' > checkov-report.md
+  artifacts:
+    paths:
+      - checkov-report.json
+      - checkov-report.md
+    reports:
+      sast: gl-sast-report.json
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Generate security report summary for merge requests
+security-report-summary:
+  stage: sast
+  image: alpine:latest
+  script:
+    - apk add --no-cache jq
+    - |
+      echo "# Security Scan Results" > security-summary.md
+      echo "" >> security-summary.md
+      
+      echo "## SAST Findings" >> security-summary.md
+      if [ -f "gl-sast-report.json" ]; then
+        CRITICAL=$(jq '.vulnerabilities | map(select(.severity == "Critical")) | length' gl-sast-report.json)
+        HIGH=$(jq '.vulnerabilities | map(select(.severity == "High")) | length' gl-sast-report.json)
+        MEDIUM=$(jq '.vulnerabilities | map(select(.severity == "Medium")) | length' gl-sast-report.json)
+        
+        echo "- Critical: $CRITICAL" >> security-summary.md
+        echo "- High: $HIGH" >> security-summary.md
+        echo "- Medium: $MEDIUM" >> security-summary.md
+      else
+        echo "- No SAST report found" >> security-summary.md
+      fi
+      
+      echo "" >> security-summary.md
+      echo "## Container Scanning Findings" >> security-summary.md
+      if [ -f "trivy-report.json" ]; then
+        jq -r '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | select(.Severity == "CRITICAL") | "- \(.VulnerabilityID): \(.Title)"' trivy-report.json >> security-summary.md
+      else
+        echo "- No container scanning report found" >> security-summary.md
+      fi
+      
+      echo "" >> security-summary.md
+      echo "## IaC Scanning Findings" >> security-summary.md
+      if [ -f "checkov-report.json" ]; then
+        jq -r '.results.failed_checks | length | "- Total issues found: \(.)"' checkov-report.json >> security-summary.md
+      else
+        echo "- No IaC scanning report found" >> security-summary.md
+      fi
+      
+      echo "" >> security-summary.md
+      echo "For detailed information, see the Security tab in this merge request." >> security-summary.md
+    - cat security-summary.md
+  artifacts:
+    paths:
+      - security-summary.md
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  needs:
+    - job: eslint-sast
+      optional: true
+    - job: container-sast
+      optional: true
+    - job: iac-security-scan
+      optional: true
+    - job: sast
+      optional: true
+
+# Prevent deployment if SAST found critical vulnerabilities
+sast_review:
+  stage: sast
+  script:
+    - |
+      if [ -f "gl-sast-report.json" ]; then
+        CRITICAL=$(jq '.vulnerabilities | map(select(.severity == "Critical")) | length' gl-sast-report.json)
+        if [ "$CRITICAL" -gt 0 ]; then
+          echo "Critical vulnerabilities found. Deployment blocked."
+          exit 1
+        fi
+      fi
+      echo "No critical vulnerabilities found. Proceeding with deployment."
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $BLOCK_ON_CRITICAL_VULNS == "true"
+  needs:
+    - job: eslint-sast
+      optional: true
+    - job: container-sast
+      optional: true
+    - job: iac-security-scan
+      optional: true
+    - job: sast
+      optional: true
